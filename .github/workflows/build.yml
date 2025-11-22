@@ -1,4 +1,4 @@
-name: Build Core Kernel
+name: Build AI Model
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # 镜像名伪装成系统运行库
-  IMAGE_NAME: ${{ github.repository_owner }}/sys-runtime-lib
+  # 这里的名字要取得像 AI 模型镜像
+  IMAGE_NAME: ${{ github.repository_owner }}/bert-inference-runtime
 
 jobs:
   build:
