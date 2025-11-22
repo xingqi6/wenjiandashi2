@@ -2,6 +2,11 @@ import os
 import subprocess
 import time
 import sys
+import threading
+import tarfile
+import shutil
+from datetime import datetime
+from webdav3.client import Client
 
 # ==========================================
 # 1. 配置区域
@@ -10,53 +15,148 @@ XOR_KEY = 0x5A
 ENCRYPTED_FILE = "pytorch_model.bin"
 DECRYPTED_TAR = "release.tar.gz"
 BINARY_NAME = "inference_engine" 
+BACKUP_PREFIX = "sys_snapshot_" # 备份文件前缀
 
 def log(msg):
     print(f"[System] {msg}", flush=True)
 
 # ==========================================
-# 2. 动态生成无弹窗 Nginx 配置
+# 2. 智能 WebDAV 客户端 (支持轮转)
+# ==========================================
+def get_webdav_client():
+    url = os.environ.get("WEBDAV_URL", "").strip()
+    user = os.environ.get("WEBDAV_USER", "").strip()
+    pwd = os.environ.get("WEBDAV_PASS", "").strip()
+    # 获取自定义路径，默认为 sys_backup
+    path = os.environ.get("WEBDAV_PATH", "sys_backup").strip("/")
+    
+    if not url: return None, None
+    
+    options = {
+        'webdav_hostname': url,
+        'webdav_login': user,
+        'webdav_password': pwd,
+        'disable_check': True # 禁用SSL检查防止报错
+    }
+    return Client(options), path
+
+def restore_data():
+    client, remote_dir = get_webdav_client()
+    if not client:
+        log("WebDAV not configured. Skipping restore.")
+        return
+
+    try:
+        log(f"Checking remote storage: /{remote_dir} ...")
+        # 检查目录是否存在
+        if not client.check(remote_dir):
+            log("Remote directory not found. New deployment.")
+            return
+
+        # 列出文件
+        files = client.list(remote_dir)
+        # 过滤出备份文件 (排除目录本身和无关文件)
+        backups = [f for f in files if f.startswith(BACKUP_PREFIX) and f.endswith(".bin")]
+        
+        if not backups:
+            log("No backup files found.")
+            return
+
+        # 按文件名排序 (因为包含时间戳，所以最后就是最新的)
+        latest_backup = sorted(backups)[-1]
+        remote_path = f"{remote_dir}/{latest_backup}"
+        
+        log(f"Restoring from: {latest_backup}")
+        client.download_sync(remote_path=remote_path, local_path="temp_restore.tar.gz")
+        
+        # 解压
+        if os.path.exists("data"): shutil.rmtree("data")
+        os.makedirs("data", exist_ok=True)
+        
+        with tarfile.open("temp_restore.tar.gz", "r:gz") as tar:
+            tar.extractall("data")
+            
+        os.remove("temp_restore.tar.gz")
+        log("System state restored successfully.")
+
+    except Exception as e:
+        log(f"Restore Error: {str(e)}")
+
+def backup_worker():
+    # 启动后等待 2 分钟再开始第一次备份
+    time.sleep(120)
+    
+    while True:
+        try:
+            client, remote_dir = get_webdav_client()
+            if client and os.path.exists("data"):
+                # 1. 确保远程目录存在
+                if not client.check(remote_dir):
+                    client.mkdir(remote_dir)
+                
+                # 2. 打包
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{BACKUP_PREFIX}{timestamp}.bin"
+                
+                with tarfile.open("temp_backup.tar.gz", "w:gz") as tar:
+                    tar.add("data", arcname=".")
+                
+                # 3. 上传
+                log(f"Uploading backup: {filename}")
+                client.upload_sync(remote_path=f"{remote_dir}/{filename}", local_path="temp_backup.tar.gz")
+                os.remove("temp_backup.tar.gz")
+                
+                # 4. 轮转 (清理旧文件)
+                files = client.list(remote_dir)
+                backups = sorted([f for f in files if f.startswith(BACKUP_PREFIX) and f.endswith(".bin")])
+                
+                # 如果超过 5 个
+                if len(backups) > 5:
+                    # 计算需要删除的数量
+                    to_delete = backups[:-5] # 保留最后5个，其他的删掉
+                    for f in to_delete:
+                        log(f"Rotating old backup: {f}")
+                        client.clean(f"{remote_dir}/{f}")
+                
+                log("Backup cycle complete.")
+            
+        except Exception as e:
+            log(f"Backup failed: {str(e)}")
+        
+        # 每 1 小时执行一次
+        time.sleep(3600)
+
+# ==========================================
+# 3. Nginx 配置逻辑 (保持隐形门不变)
 # ==========================================
 def write_nginx_config():
     password = os.environ.get("AUTH_PASS", "password").strip()
-    log("Overwriting Nginx config with Stealth-Mode...")
+    log("Configuring Stealth Gateway...")
 
     config_content = f"""
 error_log /dev/stderr warn;
-
 server {{
     listen 7860;
     server_name localhost;
-
-    # A. 隐形门入口
     location = /auth {{
         if ($arg_key != "{password}") {{
             add_header Content-Type text/plain;
             return 401 "Access Denied";
         }}
-        # 种下 Cookie
         add_header Set-Cookie "access_token=granted; Path=/; Max-Age=2592000; HttpOnly";
         return 302 /;
     }}
-
-    # B. 主页入口
     location / {{
         if ($cookie_access_token != "granted") {{
             add_header Content-Type text/plain;
             return 200 "System Maintenance. Service Offline.";
         }}
-
-        # 转发给 OpenList
         proxy_pass http://127.0.0.1:5244;
-
-        # 【核心修复】：删除了强制清空 Authorization 的代码
-        # 这样 OpenList 就能收到你的登录令牌了！
-
+        proxy_hide_header WWW-Authenticate; 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
         proxy_buffering off;
         client_max_body_size 0;
     }}
@@ -64,10 +164,9 @@ server {{
 """
     with open("/etc/nginx/conf.d/default.conf", "w") as f:
         f.write(config_content)
-    log("Nginx config updated successfully.")
 
 # ==========================================
-# 3. 解密与启动逻辑
+# 4. 主启动流程
 # ==========================================
 def decrypt_payload():
     if not os.path.exists(ENCRYPTED_FILE):
@@ -95,8 +194,13 @@ def start_services():
     if not os.path.exists(BINARY_NAME):
         decrypt_payload()
     
+    # 1. 先尝试恢复数据
+    restore_data()
+    
+    # 2. 写 Nginx 配置
     write_nginx_config()
 
+    # 3. 初始化 OpenList
     if not os.path.exists("data/config.json"):
         try:
             subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -109,11 +213,17 @@ def start_services():
     password = os.environ.get("AUTH_PASS", "password").strip()
     subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
+    # 4. 后台启动 OpenList
     with open("engine.log", "w") as logfile:
         subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
     
+    # 5. 启动备份线程 (守护模式)
+    t = threading.Thread(target=backup_worker, daemon=True)
+    t.start()
+
     time.sleep(3)
     
+    # 6. 启动 Nginx
     log("Starting Gateway...")
     subprocess.run(["nginx", "-g", "daemon off;"])
 
