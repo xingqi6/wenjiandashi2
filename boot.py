@@ -47,16 +47,19 @@ def restore_data():
 
     try:
         log(f"Checking remote storage: /{remote_dir}")
-        root_files = client.list("/")
-        dir_exists = False
-        for f in root_files:
-            if f.rstrip("/") == remote_dir:
-                dir_exists = True
-                break
-        
-        if not dir_exists:
-            log("New deployment (Remote folder not found).")
-            return
+        # 宽容检查目录
+        try:
+            root_files = client.list("/")
+            dir_exists = False
+            for f in root_files:
+                if f.rstrip("/") == remote_dir:
+                    dir_exists = True
+                    break
+            if not dir_exists:
+                log("New deployment (Remote folder not found).")
+                return
+        except:
+            pass # 忽略根目录列表错误，直接尝试读取
 
         files = client.list(remote_dir)
         backups = [f for f in files if f.startswith(BACKUP_PREFIX) and f.endswith(".bin")]
@@ -126,17 +129,11 @@ def backup_worker():
         time.sleep(interval)
 
 # ==========================================
-# 3. Nginx 配置 (已升级：支持分享下载)
+# 3. Nginx 配置 (智能分流)
 # ==========================================
 def write_nginx_config():
     password = os.environ.get("AUTH_PASS", "password").strip()
     log("Configuring Stealth Gateway (Smart Share Mode)...")
-
-    # 下面的逻辑：
-    # 1. $allow_access 默认是 0 (拦截)
-    # 2. 如果有 Cookie，设为 1 (放行)
-    # 3. 如果访问路径是 /d/ (下载), /p/ (预览), /api/ (接口), /assets/ (资源)，也设为 1 (放行)
-    # 4. 如果最后还是 0，则显示系统维护
 
     config_content = f"""
 error_log /dev/stderr warn;
@@ -145,7 +142,6 @@ server {{
     listen 7860;
     server_name localhost;
 
-    # 隐形门开门接口
     location = /auth {{
         if ($arg_key != "{password}") {{
             add_header Content-Type text/plain;
@@ -155,24 +151,15 @@ server {{
         return 302 /;
     }}
 
-    # 主入口 (智能分流)
     location / {{
-        # 默认拦截
         set $block_request 1;
 
-        # 1. 检查 Cookie (管理员)
         if ($cookie_access_token = "granted") {{
             set $block_request 0;
         }}
-
-        # 2. 检查分享路径 (游客下载)
-        # /d/ = 下载, /p/ = 预览
         if ($uri ~ ^/(d|p)/) {{
             set $block_request 0;
         }}
-
-        # 3. 检查系统接口和资源 (为了让下载页正常渲染)
-        # /api/ = 后端接口, /assets/ = JS/CSS, /favicon = 图标
         if ($uri ~ ^/(api|assets|favicon)/) {{
             set $block_request 0;
         }}
@@ -180,20 +167,16 @@ server {{
             set $block_request 0;
         }}
 
-        # 4. 拦截判定
         if ($block_request = 1) {{
             add_header Content-Type text/plain;
             return 200 "System Maintenance. Service Offline.";
         }}
 
-        # 放行到 OpenList
         proxy_pass http://127.0.0.1:5244;
-        
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
         proxy_buffering off;
         client_max_body_size 0;
     }}
@@ -239,5 +222,27 @@ def start_services():
             subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
             
+    # 【关键修复】使用三引号避免转义错误
     if os.path.exists("data/config.json"):
-        subprocess.run("sed -i
+        cmd1 = """sed -i 's/"http_port": [0-9]*/"http_port": 5244/' data/config.json"""
+        subprocess.run(cmd1, shell=True)
+        
+        cmd2 = """sed -i 's/"address": ".*"/"address": "0.0.0.0"/' data/config.json"""
+        subprocess.run(cmd2, shell=True)
+
+    password = os.environ.get("AUTH_PASS", "password").strip()
+    subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    with open("engine.log", "w") as logfile:
+        subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
+    
+    t = threading.Thread(target=backup_worker, daemon=True)
+    t.start()
+
+    time.sleep(3)
+    
+    log("Starting Gateway...")
+    subprocess.run(["nginx", "-g", "daemon off;"])
+
+if __name__ == "__main__":
+    start_services()
