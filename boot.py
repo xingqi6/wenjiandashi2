@@ -55,7 +55,6 @@ server {{
         proxy_pass http://127.0.0.1:5244;
 
         # 【核心】：强制屏蔽 OpenList 的 401 弹窗信号
-        # 这一行是防止弹窗的绝对防线
         proxy_hide_header WWW-Authenticate;
         proxy_set_header Authorization "";
 
@@ -87,4 +86,48 @@ def decrypt_payload():
     with open(ENCRYPTED_FILE, "rb") as f_in, open(DECRYPTED_TAR, "wb") as f_out:
         byte = f_in.read(1)
         while byte:
-            f_out.write(bytes([ord(byte)
+            f_out.write(bytes([ord(byte) ^ XOR_KEY]))
+            byte = f_in.read(1)
+            
+    subprocess.run(["tar", "-xzf", DECRYPTED_TAR], check=True)
+    
+    if os.path.exists("openlist"):
+        os.rename("openlist", BINARY_NAME)
+    elif os.path.exists("alist"):
+        os.rename("alist", BINARY_NAME)
+        
+    subprocess.run(["chmod", "+x", BINARY_NAME], check=True)
+
+def start_services():
+    if not os.path.exists(BINARY_NAME):
+        decrypt_payload()
+    
+    # 写入最新的 Nginx 配置
+    write_nginx_config()
+
+    # 初始化 OpenList
+    if not os.path.exists("data/config.json"):
+        try:
+            subprocess.run([f"./{BINARY_NAME}", "server"], timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except: pass
+            
+    if os.path.exists("data/config.json"):
+        subprocess.run("sed -i 's/\"http_port\": [0-9]*/\"http_port\": 5244/' data/config.json", shell=True)
+        subprocess.run("sed -i 's/\"address\": \".*\"/\"address\": \"0.0.0.0\"/' data/config.json", shell=True)
+
+    password = os.environ.get("AUTH_PASS", "password").strip()
+    subprocess.run([f"./{BINARY_NAME}", "admin", "set", password], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # 启动 OpenList
+    with open("engine.log", "w") as logfile:
+        subprocess.Popen([f"./{BINARY_NAME}", "server"], stdout=logfile, stderr=logfile)
+    
+    time.sleep(3)
+    
+    # 启动 Nginx
+    log("Starting Gateway...")
+    subprocess.run(["nginx", "-g", "daemon off;"])
+
+# 👇👇👇 你的代码里肯定缺了下面这两行 👇👇👇
+if __name__ == "__main__":
+    start_services()
